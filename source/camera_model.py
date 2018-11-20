@@ -24,64 +24,35 @@ import sys
 import tensorflow as tf
 import tools
 import random
+import shutil
 from matplotlib import pyplot as plt
 
-
-
 #################################################################################################################################################
 #################################################################################################################################################
+
+
+#IF YOU WANT TO SET THE SESSIONS TO RUN ON CPU
+#os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 #DEFINE OUR LOGGER
-
 tf.logging.set_verbosity(tf.logging.INFO)
-
 #PREDIFINED CONSTRAINTS
-EPOCH=3
+EPOCH=10
 BATCH_STEP=1000
 LEARNING_RATE = 0.0001
 HEIGHT = 436
 WIDTH = 1024
-DEPTH = 3
-PATCH_HEIGHT = 3
-PATCH_WIDTH = 3
+DEPTH = 2
+PATCH_HEIGHT = HEIGHT
+PATCH_WIDTH = WIDTH
 T_DIR1 = './data/mountain_1'
 T_DIR2 = './data/sleeping_1'
 T_DIR3 = './data/sleeping_2'
 V_DIR = './data/sleeping_1'
 all_dir = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow"
+LOG_DIR = "/media/cvlab/DATA/masa_log/cam_model"
 #################################################################################################################################################
 #################################################################################################################################################
-def gather_cols(params, indices, name=None):
-    """Gather columns of a 2D tensor.
-
-    Args:
-        params: A 2D tensor.
-        indices: A 1D tensor. Must be one of the following types: ``int32``, ``int64``.
-        name: A name for the operation (optional).
-
-    Returns:
-        A 2D Tensor. Has the same type as ``params``.
-    """
-    with tf.op_scope([params, indices], name, "gather_cols") as scope:
-        # Check input
-        params = tf.convert_to_tensor(params, name="params")
-        indices = tf.convert_to_tensor(indices, name="indices")
-        try:
-            params.get_shape().assert_has_rank(2)
-        except ValueError:
-            raise ValueError('\'params\' must be 2D.')
-        try:
-            indices.get_shape().assert_has_rank(1)
-        except ValueError:
-            raise ValueError('\'params\' must be 1D.')
-
-        # Define op
-        p_shape = tf.shape(params)
-        p_flat = tf.reshape(params, [-1])
-        i_flat = tf.reshape(tf.reshape(tf.range(0, p_shape[0]) * p_shape[1],
-                                       [-1, 1]) + indices, [-1])
-        return tf.reshape(tf.gather(p_flat, i_flat),
-                          [p_shape[0], -1])
-
 #function for tiling an image into patches of size w * h
 def get_tiles(img,width=PATCH_WIDTH,height=PATCH_HEIGHT):
 
@@ -110,156 +81,112 @@ def undo_tiles(tiles,w,h):
             count += 1
 
     return canvas
+
 #########################################################################################################
 #MODEL DEFINITION
 ##########################################################################################################
-#OUR GLOBAL STEP
-global_step = tf.Variable(0, name='global_step', trainable=False)
-inc = tf.assign_add(global_step,1)
-
-#HELPER FUNCTION
-def camera_model_single(input_):
-    #input are optical flow vectors of still objects
-    #intialize our weights and biases
-    w1 = tf.Variable(tf.random_normal([2,200],dtype=tf.float32),dtype=tf.float32)
-    w2 = tf.Variable(tf.random_normal([200,200],dtype=tf.float32),dtype=tf.float32)
-    w3 = tf.Variable(tf.random_normal([200,10],dtype=tf.float32),dtype=tf.float32)
-    b1 = tf.Variable(tf.random_normal([200],dtype=tf.float32),dtype=tf.float32)
-    b2 = tf.Variable(tf.random_normal([200],dtype=tf.float32),dtype=tf.float32)
-    b3 = tf.Variable(tf.random_normal([10],dtype=tf.float32),dtype=tf.float32)
-
-    #our model internals
-    l1 = tf.add(tf.matmul(input_,w1),b1)
-    l1_out = tf.nn.sigmoid(l1)
-    l2 = tf.add(tf.matmul(l1_out,w2),b2)
-    l2_out = tf.nn.sigmoid(l2)
-    l3 = tf.add(tf.matmul(l2_out,w3),b3)
-
-    Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f = tf.split(l3,10,axis=1)
-    Z = tf.clip_by_value(Z,1,100)
-    f = tf.clip_by_value(f,1,100)
-    a = [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f]
-    for i,tensor in enumerate(a):
-        a[i] = tf.clip_by_value(tensor,-100,100)
-
-    trans_x = tf.divide(tf.subtract(tf.multiply(Tz,X),tf.multiply(Tx,f)),Z)
-    trans_y = tf.divide(tf.subtract(tf.multiply(Tz,Y),tf.multiply(Ty,f)),Z)
-    rotation_x = tf.multiply(Wy,f) + tf.multiply(Wz,Y) + tf.divide(tf.multiply(tf.multiply(Wx,X),Y),f) - tf.divide(tf.multiply(tf.multiply(Wy,X),X),f)
-    rotation_y = tf.multiply(Wx,f) - tf.multiply(Wz,X) - tf.divide(tf.multiply(tf.multiply(Wy,X),Y),f) + tf.divide(tf.multiply(tf.multiply(Wx,Y),Y),f)
-    Vx = trans_x + rotation_x
-    Vy = trans_y - rotation_y
-    GVx = gather_cols(input_,np.array([0],dtype=np.int32))
-    GVy = gather_cols(input_,np.array([1],dtype=np.int32))
-
-    #our loss function is a simple DISTANCE FUNCTION FROM TARGET OUTPUT
-    #IF YOU NOTICE, OUR OUTPUT IS TRYING TO BE THE SAME AS OUR INPUT...
-    #THIS ONLY WORKS BECAUSE OF THE COMPLEX MODEL WE FORCE THE NEURAL NETWORK TO LEARN THE PARAMETERS FOR
-    #WE ARE HOPING THAT THE NEURAL NETWORK LEARNS TO DETERMINE THE PARAMETERS FOR THE FUNCTION WHICH CAN OUTPUT THE CORRECT CAMERA MOTION GIVEN OPTICAL FLOW VECTORS OF STILL OBJECTS
-    lossx = tf.abs(tf.subtract(Vx,GVx))
-    lossy = tf.abs(tf.subtract(Vy,GVy))
-    cost = tf.reduce_mean(tf.add(lossx,lossy))
-    opt = tf.train.AdamOptimizer(LEARNING_RATE).minimize(cost)
-
-    loss_sum = tf.summary.scalar('loss',cost)
-    f_sum = tf.summary.histogram('f',f)
-    z_sum = tf.summary.histogram('z',Z)
-
-    return {"params": a, "loss": cost, "opt": opt, "loss_sum": loss_sum, "f_sum": f_sum, "z_sum": z_sum}
-
-#our model
 with tf.variable_scope('cam_model'):
     with tf.variable_scope('param_predictor'):
 
-        #input are optical flow vectors of still objects
-        x = tf.placeholder(tf.float32,[None,PATCH_HEIGHT,PATCH_WIDTH,2])
-        x_reshaped = tf.reshape(x,(-1,PATCH_HEIGHT * PATCH_WIDTH,2))
-        vecs = tf.split(x_reshaped,PATCH_HEIGHT * PATCH_WIDTH,axis=1)
+        #input are optical flow vectors as patches
+        x = tf.placeholder(tf.float32,[None,PATCH_HEIGHT,PATCH_WIDTH,DEPTH])
+        #Z = tf.placeholder(tf.float32,[None,PATCH_HEIGHT,PATCH_WIDTH])
 
-        #otuputs
-        outputs = []
-        values = []
-        for v in vecs:
-            v = tf.reshape(v,[-1,2])
-            params = camera_model_single(v)
-            values.append(params)
-            outputs += params["params"]
+        #normalize x
+        #x = tf.divide(tf.subtract(x,tf.reduce_min(x)),tf.subtract(tf.reduce_max(x),tf.reduce_min(x)))
+        #x_reshaped = tf.reshape(x,[-1,PATCH_WIDTH * PATCH_HEIGHT,DEPTH])
+        #vecs = tf.split(x_reshaped,2,axis=2)
+        GVx,GVy = tf.split(x,2,axis=-1)
 
-        #intialize our weights and biases
-        w1 = tf.Variable(tf.random_normal([PATCH_WIDTH * PATCH_HEIGHT * 10,300],dtype=tf.float32),dtype=tf.float32)
-        w2 = tf.Variable(tf.random_normal([300,300],dtype=tf.float32),dtype=tf.float32)
-        w3 = tf.Variable(tf.random_normal([300,10],dtype=tf.float32),dtype=tf.float32)
-        b1 = tf.Variable(tf.random_normal([300],dtype=tf.float32),dtype=tf.float32)
-        b2 = tf.Variable(tf.random_normal([300],dtype=tf.float32),dtype=tf.float32)
-        b3 = tf.Variable(tf.random_normal([10],dtype=tf.float32),dtype=tf.float32)
+        #w1 = tf.Variable(tf.random_normal([13,13,2,32],dtype=tf.float32),dtype=tf.float32)
+        #w2 = tf.Variable(tf.random_normal([7,7,32,32],dtype=tf.float32),dtype=tf.float32)
+        #w3 = tf.Variable(tf.random_normal([3,3,32,10],dtype=tf.float32),dtype=tf.float32)
+        #b1 = tf.Variable(tf.random_normal([32],dtype=tf.float32),dtype=tf.float32)
+        #b2 = tf.Variable(tf.random_normal([32],dtype=tf.float32),dtype=tf.float32)
+        #b3 = tf.Variable(tf.random_normal([10],dtype=tf.float32),dtype=tf.float32)
 
-        #concatenate our list of parameters from our network
-        outputs = tf.concat(outputs,axis=1)
+        #conv1 = tf.nn.conv2d(x,w1,strides=[1,1,1,1],padding='SAME')
+        #conv1_out = tf.nn.sigmoid(tf.nn.bias_add(conv1,b1))
+        #conv2 = tf.nn.conv2d(conv1_out,w2,strides=[1,1,1,1],padding='SAME')
+        #conv2_out = tf.nn.sigmoid(tf.nn.bias_add(conv2,b2))
+        #conv3 = tf.nn.conv2d(conv2_out,w3,strides=[1,1,1,1],padding='SAME')
+        #conv3_out = tf.nn.bias_add(conv3,b3)
 
-        #our model internals
-        l1 = tf.add(tf.matmul(outputs,w1),b1)
-        l1_out = tf.nn.sigmoid(l1)
-        l2 = tf.add(tf.matmul(l1_out,w2),b2)
-        l2_out = tf.nn.sigmoid(l2)
-        l3 = tf.add(tf.matmul(l2_out,w3),b3)
+        def linear_function(x_):
+            wx = tf.Variable(tf.random_normal([PATCH_HEIGHT,PATCH_WIDTH],dtype=tf.float32),dtype=tf.float32)
+            wy = tf.Variable(tf.random_normal([PATCH_HEIGHT,PATCH_WIDTH],dtype=tf.float32),dtype=tf.float32)
+            b = tf.Variable(tf.random_normal([PATCH_HEIGHT,PATCH_WIDTH],dtype=tf.float32),dtype=tf.float32)
 
-        #our physics equation to calculate optical flow
-        #outputs are the paremeters for our optical flow equation
-        #tx,ty,tz,wx,wy,wz,x,y,z
-        Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f = tf.split(l3,10,axis=1)
-        Z = tf.clip_by_value(Z,1,100)
-        f = tf.clip_by_value(f,1,100)
-        a = [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f]
-        for i,tensor in enumerate(a):
-            a[i] = tf.clip_by_value(tensor,-100,100)
+            outx = tf.multiply(x_[:,:,:,0],wx)
+            outy = tf.multiply(x_[:,:,:,1],wy)
+            activation = tf.nn.relu(outx + outy + b)
 
+            w_out = tf.Variable(tf.random_normal([PATCH_HEIGHT,PATCH_WIDTH],dtype=tf.float32),dtype=tf.float32)
+            b_out = tf.Variable(tf.random_normal([PATCH_HEIGHT,PATCH_WIDTH],dtype=tf.float32),dtype=tf.float32)
+            output = tf.multiply(activation,w_out) + b_out
+
+            return output
+
+        Tx = linear_function(x)
+        Ty = linear_function(x)
+        Tz = linear_function(x)
+        Wx = linear_function(x)
+        Wy = linear_function(x)
+        Wz = linear_function(x)
+        X = linear_function(x)
+        Y = linear_function(x)
+        Z = linear_function(x)
+        f = linear_function(x)
+
+        #clip the values to a range
+        #Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f = tf.split(out3,10,axis=-1)
+        Z = tf.clip_by_value(Z,1,1000)
+        f = tf.clip_by_value(f,1,1000)
+        Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f = [tf.clip_by_value(val,-1000,1000) for val in [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f]]
+
+        #compute the loss using the parameters found
         trans_x = tf.divide(tf.subtract(tf.multiply(Tz,X),tf.multiply(Tx,f)),Z)
         trans_y = tf.divide(tf.subtract(tf.multiply(Tz,Y),tf.multiply(Ty,f)),Z)
         rotation_x = tf.multiply(Wy,f) + tf.multiply(Wz,Y) + tf.divide(tf.multiply(tf.multiply(Wx,X),Y),f) - tf.divide(tf.multiply(tf.multiply(Wy,X),X),f)
         rotation_y = tf.multiply(Wx,f) - tf.multiply(Wz,X) - tf.divide(tf.multiply(tf.multiply(Wy,X),Y),f) + tf.divide(tf.multiply(tf.multiply(Wx,Y),Y),f)
-        Vx = trans_x - rotation_x
-        Vy = trans_y + rotation_y
+        Vx = trans_x + rotation_x
+        Vy = trans_y - rotation_y
+
+        Vx = tf.reshape(Vx,[-1,436,1024,1])
+        Vy = tf.reshape(Vx,[-1,436,1024,1])
 
         #our loss function is a simple DISTANCE FUNCTION FROM TARGET OUTPUT
         #IF YOU NOTICE, OUR OUTPUT IS TRYING TO BE THE SAME AS OUR INPUT...
         #THIS ONLY WORKS BECAUSE OF THE COMPLEX MODEL WE FORCE THE NEURAL NETWORK TO LEARN THE PARAMETERS FOR
         #WE ARE HOPING THAT THE NEURAL NETWORK LEARNS TO DETERMINE THE PARAMETERS FOR THE FUNCTION WHICH CAN OUTPUT THE CORRECT CAMERA MOTION GIVEN OPTICAL FLOW VECTORS OF STILL OBJECTS
-        GVx = tf.gather(x_reshaped,[0],axis=-1)
-        GVy = tf.gather(x_reshaped,[1],axis=-1)
-        GVx = tf.reshape(GVx,(-1,PATCH_WIDTH * PATCH_HEIGHT))
-        GVy = tf.reshape(GVy,(-1,PATCH_WIDTH * PATCH_HEIGHT))
+        #CONDITIONAL LOSS ON ACCURACY OF X AND Y calibration before the optical flow calculation
 
-        lossx = tf.abs(tf.subtract(Vx,GVx))
-        lossy = tf.abs(tf.subtract(Vy,GVy))
-        lossx_out = tf.reduce_mean(lossx,axis=1)
-        lossy_out = tf.reduce_mean(lossy,axis=1)
-        cost = tf.reduce_mean(tf.add(lossx,lossy))
+        #WE WANT THE CAMERA CALIBRATED ON THE CENTER TO BE 0,0
+        loss1 = tf.reduce_mean(tf.abs(X[:,:,int(WIDTH / 2)]))
+        loss2 = tf.reduce_mean(tf.abs(Y[:,int(HEIGHT/2),:]))
+        loss3 = tf.reduce_mean(tf.abs(tf.subtract(Vx,GVx)))
+        loss4 = tf.reduce_mean(tf.abs(tf.subtract(Vy,GVy)))
+        cost = loss1 + loss2 + loss3 + loss4
 
-        optlist = [w1,w2,w3,b1,b2,b3]
-        opt = tf.train.AdamOptimizer(LEARNING_RATE).minimize(cost,var_list=optlist)
+        opt = tf.train.AdamOptimizer(LEARNING_RATE).minimize(cost)
 
-        loss_summary = tf.summary.scalar('loss',cost)
-        Tx_summary = tf.summary.histogram('Tx',Tx)
-        Ty_summary = tf.summary.histogram('Ty',Ty)
-        Tz_summary = tf.summary.histogram('Tz',Tz)
-        Wx_summary = tf.summary.histogram('Wx',Wx)
-        Wy_summary = tf.summary.histogram('Wy',Wy)
-        Wz_summary = tf.summary.histogram('Wz',Wz)
-        X_summary = tf.summary.histogram('X',X)
-        Y_summary = tf.summary.histogram('Y',Y)
-        Z_summary = tf.summary.histogram('Z',Z)
-        f_summary = tf.summary.histogram('f',f)
+        A = [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f]
+        for i,val in enumerate(A):
+            A[i] = tf.cast(tf.divide(tf.subtract(val,tf.reduce_min(val)),tf.reduce_max(val)),tf.float32)
 
-        summaries = [loss_summary,Tx_summary,Ty_summary,Tz_summary,Wx_summary,Wy_summary,Wz_summary,X_summary,Y_summary,Z_summary,f_summary]
-        summaries1 = []
+        summs = []
+        summs.append(tf.summary.scalar('loss1',loss1))
+        summs.append(tf.summary.scalar('loss2',loss2))
+        summs.append(tf.summary.scalar('loss3',loss3))
+        summs.append(tf.summary.scalar('loss4',loss4))
+        for name,tens in zip(['Tx','Ty','Tz','Wx','Wy','Wz','X','Y','Z','f'],A):
 
-for val in values:
-    summaries1.append(val["loss_sum"])
-    summaries1.append(val["z_sum"])
-    summaries1.append(val["f_sum"])
+            img = tf.reshape(tens[0],[-1,436,1024,1])
+            summary = tf.summary.image(name,img)
+            summs.append(summary)
 
 saver = tf.train.Saver()
-merged1 = tf.summary.merge(summaries1)
-merged = tf.summary.merge(summaries)
+merged = tf.summary.merge([summ for summ in summs])
 
 #MODEL END
 ##########################################################################################################
@@ -273,56 +200,37 @@ def test(flow_path, ckpt_path=''):
         for file_name in a:
             full_path = os.path.join(flow_path,file_name)
             test(full_path)
-
-    print(ckpt_path)
+        return True
 
     input_flow = tools.readflofile(flow_path)
-    tiles = get_tiles(input_flow)
-
     h,w,d = input_flow.shape
-    x_in = input_flow.reshape((h*w,d))
 
     sess = tf.Session()
     sess.run(tf.global_variables_initializer())
     if ckpt_path != '':
         saver.restore(sess,ckpt_path)
 
-    myvars = [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f,Vx,Vy,lossx_out,lossy_out,cost]
-    myvar_names = ["Tx","Ty","Tz","Wx","Wy","Wz","X","Y","Z","f","Vx","Vy","lossx","lossy","cost"]
+    myvars = [Tx,Ty,Tz,Wx,Wy,Wz,X,Y,Z,f,Vx,Vy,lossx,lossy,cost]
+    myvar_names = ["Tx","Ty","Tz","Wx","Wy","Wz","X","Y","Z","f","Vx","Vy",'lossx','lossy',"cost"]
 
-    output = sess.run(myvars, feed_dict={x: tiles})
+    output = sess.run(myvars, feed_dict={x: input_flow.reshape((1,h,w,d))})
 
     #VISUALIZE TRAINED PARAMETERS
     for val,val_name in zip(output[:-1],myvar_names[:-1]):
-        img = undo_tiles(val,w,h)
-        img -= np.amin(img)
-        img = img / np.amax(img) * 255
-        cv2.imshow(val_name,img.astype(np.uint8))
+        val -= np.amin(val)
+        val = val / np.amax(val) * 255
+        cv2.imshow(val_name,val.reshape((h,w)).astype(np.uint8))
 
     cv2.waitKey(0)
-
     print("my loss is %.4f" % output[-1])
 
 ##########################################################################################################
 # define our training module
 #GET OUR TESTING BATCH
-def getTBatch(file_list):
-    tmp = []
-    count = 0
-    for f in file_list:
-        flowfield = tools.readflofile(f)
-        tiles = get_tiles(flowfield)
-        tmp.append(tiles)
-        count += tiles.shape[0]
+def getTBatch(f):
+    flowfield = tools.readflofile(f)
 
-    train_x = np.zeros((count,PATCH_HEIGHT,PATCH_WIDTH,2))
-    cur_count = 0
-    for i,field in enumerate(tmp):
-        length = field.shape[0]
-        train_x[cur_count: cur_count + length] = field
-        cur_count += length
-
-    return train_x
+    return flowfield.reshape((1,flowfield.shape[0],flowfield.shape[1],flowfield.shape[2]))
 
 #training / testing cross validation
 def train(ckpt_path='',mode='still',name='cam_model'):
@@ -334,61 +242,37 @@ def train(ckpt_path='',mode='still',name='cam_model'):
             saver.restore(sess,ckpt_path)
 
         #training/testing logger
-        if not os.path.isdir("./log/cam_model"):
-            os.mkdir("./log/cam_model")
-        tools.clearFile("./log/cam_model")
-        training_writer = tf.summary.FileWriter('./log/cam_model/training',sess.graph)
-        testing_writer = tf.summary.FileWriter('./log/cam_model/testing',sess.graph)
+        if not os.path.isdir(LOG_DIR):
+            os.mkdir(LOG_DIR)
 
-        modelout = os.path.join('model',name) + '.ckpt'
+        training_writer = tf.summary.FileWriter(os.path.join(LOG_DIR,'training'),sess.graph)
+        testing_writer = tf.summary.FileWriter(os.path.join(LOG_DIR,'testing'),sess.graph)
 
         #my training data as file names
         training_list = []
-        if mode == 'still':
-            training_list.append([os.path.join(T_DIR1,fname) for fname in os.listdir(T_DIR1)])
-            training_list.append([os.path.join(T_DIR2,fname) for fname in os.listdir(T_DIR2)])
-            training_list.append([os.path.join(T_DIR3,fname) for fname in os.listdir(T_DIR3)])
-        elif mode == 'all':
-            for flow_dir in os.listdir(all_dir):
-                training_list.append([os.path.join(all_dir,flow_dir,flow_path) for flow_path in os.listdir(os.path.join(all_dir,flow_dir))])
+        for flow_dir in os.listdir(all_dir):
+            training_list += [os.path.join(all_dir,flow_dir,flow_path) for flow_path in os.listdir(os.path.join(all_dir,flow_dir))]
+            random.shuffle(training_list)
 
         #our training steps
         counter = 0
         for i in range(EPOCH):
             for j in range(len(training_list)):
-                #training batch getter
                 train_x = getTBatch(training_list[j])
+                #merge our summaries
+                summary = sess.run([cost,opt,merged],feed_dict={x: train_x[:]})
+                lossvalue = summary[0]
+                curr_loss = float(lossvalue)
 
-                #go through our steps
-                for s in range(0,len(train_x),BATCH_STEP):
+                #RECORD SUMMARY ON TENSORFLOW AND TERMINAL
+                training_writer.add_summary(summary[-1],global_step=counter)
+                counter += 1
 
-                    #merge our summaries
-                    losses = []
-                    for param in values:
-                        summary = sess.run([param["loss"],param["opt"],merged1],feed_dict={x: train_x[s:s+BATCH_STEP]})
-                        losses.append(summary[0])
+                #SAVE THE BEST MODEL
+                curr_loss = float(lossvalue)
+                saver.save(sess,os.path.join("model",'cam_model') + '.ckpt')
 
-                    saver.save(sess,modelout)
-                    training_writer.add_summary(summary[-1],global_step=counter)
-                    counter += 1
-
-                print("epoch: %i batch %i cost %.4f" % (i,j,summary[0]))
-
-        counter = 0
-        for i in range(EPOCH):
-            for j in range(len(training_list)):
-                #training batch getter
-                train_x = getTBatch(training_list[j])
-
-                #go through our steps
-                for s in range(0,len(train_x),BATCH_STEP):
-
-                    summary = sess.run([cost,opt,merged],feed_dict={x: train_x[s:s+BATCH_STEP]})
-                    saver.save(sess,modelout)
-                    training_writer.add_summary(summary[-1],global_step=counter)
-                    counter += 1
-
-                print("epoch: %i batch %i cost %.4f" % (i,j,summary[0]))
+                print('epoch: %i batch_size: %i loss: %.4f ' % (i+1,j,lossvalue))
 
 ##########################################################################################################
 ##########################################################################################################
@@ -401,15 +285,10 @@ if __name__ == '__main__':
     if '-train' in sys.argv:
         model = ''
         mode = 'still'
-        name = 'cam_model'
         if '-model' in sys.argv:
             model = sys.argv[sys.argv.index('-model') + 1]
-        if '-input' in sys.argv:
-            mode = sys.argv[sys.argv.index('-input') +1]
-        if '-name' in sys.argv:
-            name = sys.argv[sys.argv.index('-name') + 1]
 
-        train(ckpt_path=model,mode=mode,name=name)
+        train(ckpt_path=model,mode=mode)
 
     elif '-test' in sys.argv:
         model = ''
@@ -419,13 +298,11 @@ if __name__ == '__main__':
             print('YOU NEED A MODEL TO TEST ON...')
 
         test(sys.argv[sys.argv.index('-test') + 1],ckpt_path=model)
+
     else:
         img=  cv2.imread(sys.argv[1])
 
         tiled = get_tile_images(img)
         print(tiled.shape)
         print(tiled)
-
-
-
 

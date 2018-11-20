@@ -68,6 +68,7 @@ def undo_tiles(tiles,w,h):
             count += 1
 
     return canvas
+
 ####################################################################################################################################
 #GENERATE VIDEO SEQUENCE FROM SEQUENCE OF IMAGES AND THE FLOW MAP
 def genFlowSeq(img,flowseq):
@@ -143,11 +144,11 @@ def showVec(vecs,waitkey=0,name='colored flow'):
         hsv[..., 0] = ang * 180 / np.pi / 2
         hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        #cv2.namedWindow(name + str(i),cv2.WINDOW_NORMAL)
         cv2.imshow(name + str(i), bgr)
 
     cv2.waitKey(waitkey)
 ####################################################################################################################################
-
 #WARP THE IMAGE t to t+s USING OPTICAL FLOW t
 def warpImgwFlow(img, flow,direction='forward'):
     h,w,d = img.shape
@@ -162,9 +163,8 @@ def warpImgwFlow(img, flow,direction='forward'):
 
     warp_im = np.empty((h,w,d),dtype=np.float32)
 
-    warp_im[:,:,0]= ndimage.map_coordinates(img[:,:,0], grid, order=5,mode='constant',prefilter=False)
-    warp_im[:,:,1]= ndimage.map_coordinates(img[:,:,1], grid, order=5,mode='constant',prefilter=False)
-    warp_im[:,:,2]= ndimage.map_coordinates(img[:,:,2], grid, order=5,mode='constant',prefilter=False)
+    for i in range(d):
+        warp_im[:,:,i]= ndimage.map_coordinates(img[:,:,i], grid, order=5,mode='constant',prefilter=False)
 
     return warp_im
 
@@ -175,12 +175,12 @@ def customWarp(img,flow,direction='forward'):
     canvas.fill(0)
     initial_pos = np.dstack(np.meshgrid(np.arange(w),np.arange(h)))
 
-    #loop through each flow and map the current pixels backwards in time
-    cur_map = np.rint(initial_pos - flow)
+    #loop through each flow and map the current pixels forward in time
+    cur_map = np.rint(initial_pos + flow)
 
     #FIND THE NEW BOUNDRIES I.E SPOTS WHERE THE CURMAP FALL OFF THE IMAGE
     leftbound = np.logical_and(cur_map[:,:,0] >= 0,cur_map[:,:,1] >= 0)
-    rightbound = np.logical_and(cur_map[:,:,0] < w-1,cur_map[:,:,1] < h-1)
+    rightbound = np.logical_and(cur_map[:,:,0] < w,cur_map[:,:,1] < h)
     boundry = np.logical_and(leftbound,rightbound)
 
     idx = (cur_map[boundry][:,1] * (w)) + cur_map[boundry][:,0]
@@ -191,16 +191,44 @@ def customWarp(img,flow,direction='forward'):
 
     return canvas
 
-####################################################################################################################################
+def map_new(orig,final,new_map):
 
+    h,w,d = orig.shape
+    R2 = np.dstack(np.meshgrid(np.arange(w),np.arange(h)))
+    flow = new_map - R2
+
+    tmp = orig[200:300,400:500,:]
+    tmp2 = final[200:300,400:500,:]
+    tmp3 = new_map[200:300,400:500,:]
+    tmp4 = R2[200:300,400:500,:]
+    f_tmp = tmp3 - tmp4
+
+    tmp5 = tmp4.copy()
+
+    tmp5[:,:,0] = tmp4[:,:,0] - 400
+    tmp5[:,:,1] = tmp4[:,:,1] - 200
+
+    new_img = warpImgwFlow(tmp5,f_tmp)
+    new_img2 = warpImgwFlow(orig,flow)
+    showVec([orig,final,tmp,new_img,new_img2])
+
+    quit()
+
+
+
+####################################################################################################################################
 #NOTE THAT THE FLOW
 #assuming flows is already ordered such that flows[0] = t and flows[n] = t - s
-#THE ONLY DIFFERENCE BETWEEN THIS ONE AND THE OTHER ONE IS THE ORDERING OF THE DATA
-def stitchFlow(flows):
+#NOTE THAT THIS FUNCTION CREATES SEQUENCES FOR THE FLOW AND ORDERING OF THE DATA MATTERS!
+#IF T0 IS REFERENCING T THEN THEN WE ARE SEQUENCING FLOW VECTOR BACKWARDS FROM T TO T-N.
+#IF T0 IS REFERENCING T-N THEN WE ARE SEQUENCING FLOW VECTOR FORWARD FROM T-N TO T
+def stitchFlow(flows,mode='back'):
     n,h,w,d = flows.shape
 
     #SORRY I WAS TOO LAZY TO FIX THE DATA READING
     data = np.zeros((n,h,w,d))
+    out1 = np.zeros((h,w,n,d))
+    out2 = np.zeros((h,w,n,d))
 
     #loop through each flow and map the current pixels backwards in time
     for i,flow in enumerate(flows):
@@ -208,11 +236,15 @@ def stitchFlow(flows):
         if i == 0:
             prv_map = np.dstack(np.meshgrid(np.arange(w),np.arange(h)))
             data[t] = flows[0]
+            out2[:,:,i,:] = prv_map
             continue
 
         #MOVE THE PRVEVIOUS MAP TO THE CURRENT MAP
         #PLUS SIGN MOVE CUR_IMAGE BACKWARDS WITH CUR_FLOW
-        cur_map = np.rint(prv_map + data[t+1]).astype(np.int64)
+        if mode == 'back':
+            cur_map = np.rint(prv_map + data[t+1]).astype(np.int64)
+        else:
+            cur_map = np.rint(prv_map - data[t+1]).astype(np.int64)
 
         #FIND THE NEW BOUNDRIES I.E SPOTS WHERE THE CURMAP FALL OFF THE IMAGE
         leftbound = np.logical_and(cur_map[:,:,0] >= 0,cur_map[:,:,1] >= 0)
@@ -231,60 +263,17 @@ def stitchFlow(flows):
         data[t][boundry][:,0] = flow[:,:,0].flatten()[idx]
         data[t][boundry][:,1] = flow[:,:,1].flatten()[idx]
         data[t][boundry] = np.dstack((flow[:,:,0].flatten()[idx],flow[:,:,1].flatten()[idx]))
-
-        prv_map = cur_map.copy()
-
-    out = np.zeros((h,w,n,d))
-    for i in range(n):
-        out[:,:,i,:] = data[i,:,:,:]
-
-    return out
-
-####################################################################################################################################
-#NOTE THAT THE FLOW
-#assuming flows is already ordered such that flows[0] = t and flows[n] = t - s
-def stitchFlowForward(flows):
-    n,h,w,d = flows.shape
-
-    #SORRY I WAS TOO LAZY TO FIX THE DATA READING
-    data2 = np.zeros((h,w,n,d))
-    data = np.zeros((n,h,w,d))
-
-    #loop through each flow and map the current pixels backwards in time
-    for i,flow in enumerate(flows):
-        t = (n-1) - i
-        if i == 0:
-            prv_map = np.dstack(np.meshgrid(np.arange(w),np.arange(h)))
-            data[t] = flows[0]
-            continue
-
-        #MOVE THE PRVEVIOUS MAP TO THE CURRENT MAP
-        cur_map = np.rint(prv_map - data[t+1]).astype(np.int64)
-
-        #FIND THE NEW BOUNDRIES I.E SPOTS WHERE THE CURMAP FALL OFF THE IMAGE
-        leftbound = np.logical_and(cur_map[:,:,0] >= 0,cur_map[:,:,1] >= 0)
-        rightbound = np.logical_and(cur_map[:,:,0] < h,cur_map[:,:,1] < w)
-        boundry = np.logical_and(leftbound,rightbound)
-
-        #set data out of bounds to the previous
-        data[t][np.logical_not(boundry)] = data[t+1][np.logical_not(boundry)]
-
-        #WELL THIS IS PROBABLY MY MOST WELL MADE ALGORITHM...
-        #THIS ONE SAYS TAKE YOUR BIPARTITE GRAPH DATA_t, FLOW AND CONNECT THEM USING CUR_MAP WHICH SETS DATA_ij to FLOW_ab by the
-        #linear function C = A * w + B   where A is the list of column_id in CUR_MAP, B is the list of row_id in CUR_MAP, and C would be the
-        #index of Flow_ij flattened. We then set DATA_ij to FLOW_ab if it is within the boundries of ij
-        idx = (cur_map[boundry][:,0] * (w)) + cur_map[boundry][:,1]
-
-        data[t][boundry][:,0] = flow[:,:,0].flatten()[idx]
-        data[t][boundry][:,1] = flow[:,:,1].flatten()[idx]
-        data[t][boundry] = np.dstack((flow[:,:,0].flatten()[idx],flow[:,:,1].flatten()[idx]))
+        out2[:,:,i,:] = cur_map.copy()
 
         prv_map = cur_map.copy()
 
     for i in range(n):
-        data2[:,:,i,:] = data[i,:,:,:]
+        out1[:,:,i,:] = data[i,:,:,:]
 
-    return data2
+    out2[:,:,:,0] = out2[:,:,:,0] / w
+    out2[:,:,:,1] = out2[:,:,:,1] / h
+
+    return out1,out2
 
 ####################################################################################################################################
 #LEARN BACKGROUND?

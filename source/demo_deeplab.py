@@ -52,14 +52,11 @@ model = gluoncv.model_zoo.get_model('deeplab_resnet101_ade', pretrained=True)
 # make prediction using single scale
 output = model.demo(img)
 predict = mx.nd.squeeze(mx.nd.argmax(output, 1)).asnumpy()
-print(predict)
 
 ##############################################################################
 # Add color pallete for visualization
 mask = get_color_pallete(predict, 'ade20k')
 
-print(mask)
-quit()
 mask.save('output.png')
 
 ##############################################################################
