@@ -38,10 +38,12 @@ LR = 0.0001
 DEPTH = 2
 HEIGHT = 436
 WIDTH = 1024
-DATA_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow/alley_2/"
+FLOW_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/"
+DATA_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/"
+DATA_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/"
 TEST_DIR1 = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow/alley_1/"
 TEST_DIR2 = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow/cave_4/"
-LOG_DIR = "/media/cvlab/DATA/masa_log/bird_model"
+LOG_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/masa_log/bird_model"
 TEST_DIR = './data/alley2/'
 ALL_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow"
 
@@ -55,7 +57,6 @@ ALL_DIR = "/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sinte
 def normalize(x):
     return tf.divide(tf.subtract(x,tf.reduce_min(x)),tf.subtract(tf.reduce_max(x),tf.reduce_min(x)))
 
-
 def bird_model(input_):
     n_hidden = 100
 
@@ -68,8 +69,6 @@ def bird_model(input_):
 
     return tf.matmul(outputs[:,-1,:],w) + b
 
-
-
 ##########################################################################################################
 ##########################################################################################################
 ##########################################################################################################
@@ -80,14 +79,10 @@ def bird_model(input_):
 #MODEL DEFINITION
 ##########################################################################################################
 #OUR GLOBAL STEP
-
-
-
 #MODEL END
 ##########################################################################################################
 # define our execution module
 ##########################################################################################################
-
 def test(test_dir=DATA_DIR,ckpt_path=''):
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
@@ -248,7 +243,7 @@ def train(ckpt_path='',mode='real'):
                     saver.save(sess,'model/bird_model.ckpt')
 
                 print('epoch: %i loss: %.4f ' % (i+1,lossvalue))
-
+'''
 #training / testing cross validation
 def train2(ckpt_path='',mode='real'):
     with tf.Session() as sess:
@@ -309,6 +304,8 @@ def train2(ckpt_path='',mode='real'):
                     saver.save(sess,'model/bird_model.ckpt')
 
                 print('epoch: %i loss: %.4f \n' % (i+1,lossvalue))
+'''
+
 
 # MAIN FUNCTION
 if __name__ == '__main__':
@@ -330,6 +327,8 @@ if __name__ == '__main__':
     #seq_length = tf.placeholder(tf.int32)
     saver = tf.train.Saver()
     merged = tf.summary.merge([loss_summary])
+
+    #EXECUTION OPTIONS
     if '-train' in sys.argv:
         model = ''
         ex_data = 'real'
@@ -339,6 +338,7 @@ if __name__ == '__main__':
             ex_data = sys.argv[sys.argv.index('-example') + 1]
 
         train(ckpt_path=model,mode=ex_data)
+
     if '-test' in sys.argv:
         model = ''
         if '-model' in sys.argv:
@@ -358,5 +358,57 @@ if __name__ == '__main__':
         files = [os.path.join('data/market2_t4/',f) for f in os.listdir('data/market2_t4/')]
         predict(files,ckpt_path=model)
 
+    if '-debug' in sys.argv:
+
+        depth_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/MPI-Sintel-depth-training-20150305/training/depth/'
+        flow_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow/'
+        img_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/clean/'
+        out_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/semantic_prediction/t_data/'
+
+        #GO THROUGH EVERY SCENE
+        scenes = os.listdir(img_dir)
+        a = 0
+        for s in scenes:
+            if not(s == 'market_2' or s == 'cave_2'): continue
+            d_file = os.path.join(depth_dir,s)
+            f_file = os.path.join(flow_dir,s)
+            i_file = os.path.join(img_dir,s)
+
+            #CHECK IF DIRECTORY EXISTS
+            if not os.path.isdir(d_file) or not os.path.isdir(f_file) or not os.path.isdir(i_file): break
+
+            #EXTRACT THE DATA USING TOOLS
+            depth_list = os.listdir(d_file)
+            flow_list = os.listdir(f_file)
+            img_list = os.listdir(i_file)
+            depth_list.sort() ; flow_list.sort() ; img_list.sort()  #SORT THE FILES SO WE GO OVER EACH FILE TOGETHER
+
+            depth_list = [os.path.join(d_file,fname) for fname in depth_list]
+            flow_list = [os.path.join(f_file,fname) for fname in flow_list]
+            img_list = [os.path.join(i_file,fname) for fname in img_list]
+
+            #READ FIRST 5 FRAMES AND STITCH IT
+            for j in range(len(img_list) - 5):
+                d = depth_list[j:j+5]
+                f = flow_list[j:j+5]
+                i = img_list[j:j+5]
+
+                depth_map = np.stack([tools.read_depth(d[a]) for a in range(5)])
+                flow_map = np.stack([tools.readflofile(f[a]) for a in range(5)])
+                img_map = np.stack([cv2.imread(i[a]) for a in range(5)])
+                data = tools.stitchFlow(flow_map,depth_map,img_map)
+
+                out_file = s + '_' + str(j) + '-' + str(j + 5)
+                np.save(os.path.join(out_dir,out_file),data)
+
+                print("%i of %i DONE" % (j,len(img_list)))
+
+            print("COMPLETED SET %i of %i" % (a + 1,len(scenes)))
+            a += 1
+
     else:
         print('hello world')
+
+
+
+

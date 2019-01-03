@@ -4,6 +4,7 @@ import os
 import sys
 import random
 import shutil		#for removing file directories we are logging into
+import time
 from matplotlib import pyplot as plt
 from scipy import ndimage
 
@@ -138,11 +139,12 @@ def showVec(vecs,waitkey=0,name='colored flow'):
 
     for i,vec in enumerate(vecs):
         hsv = np.zeros((vec.shape[0],vec.shape[1],3), dtype=np.uint8)
-        hsv[..., 1] = 255
+        hsv[:,:, 1] = 255
 
         mag, ang = cv2.cartToPolar(vec[:,:, 0], vec[:,:, 1])
-        hsv[..., 0] = ang * 180 / np.pi / 2
-        hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+        print(mag,ang)
+        hsv[:,:, 0] = ang * 180 / np.pi / 2
+        hsv[:,:, 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         #cv2.namedWindow(name + str(i),cv2.WINDOW_NORMAL)
         cv2.imshow(name + str(i), bgr)
@@ -214,66 +216,145 @@ def map_new(orig,final,new_map):
 
     quit()
 
+####################################################################################################################################
+#FIND PIXEL TO PIXEL TEMPORAL CORRESPONDANCE ACROSS A VIDEO FRAME SEQUENCE
+#INPUT:
+#   OPTICAL FLOW MAP FOR EACH SEQUENCE
+#   DEPTH MAP FOR EACH SEQUENCE
+#   IMG MAP FOR EACH SEQUENCE (OPTIONAL)
+#OUTPUT:
+#   PIXEL CORRESPONDANCE OF FINAL FRAME IN THE VIDEO SEQUENCE AS NUMPY ARRAY
+#   OF SHAPE (H,W,N,5)
+#   WHERE VALUES ARE [Fx,Fy,pos_i,pos_j,depth]
+#
+def stitchFlow(f_maps,d_maps,img_map):
+    n,h,w,d = f_maps.shape
 
+    #INITIALIZE OUTPUT DATA
+    out = np.zeros((h,w,n,5))
+
+    #INITIALIZE SOME DATA STRUCTURES FOR THE MAPPING
+    cur_map = np.dstack(np.meshgrid(np.arange(w),np.arange(h)) + [d_maps[0,:,:]]).astype(np.float32)
+    active_threads = np.ones((h,w)) == 1        #ALL THREADS START OFF ACTIVE
+    grid = np.dstack(np.meshgrid(np.arange(w),np.arange(h))).astype(np.uint32)  #DEFAULT LABEL NAMES
+    positions = grid.reshape((h*w,2))[:,1] * w + grid.reshape((h*w,2))[:,0]
+    indices = set(positions)
+    #STITCH OPTICAL FLOW FORWARD
+    #ALWAYS MAP LABEL LOCATIONS TO PIXEL LOCATIONS. LABEL LOCATIONS ARE THE SAME AS PIXEL LOCATIONS STARTING OFF.
+    for i,maps in enumerate(zip(f_maps,d_maps,img_map)):
+        #INITIALIZE THE DATA FOR CURRENT FRAME
+        flow,depth,img = maps
+
+        #SAVE CURRENT STATE INFORMATION TO THE ACTIVE THREADS
+        #update valid threads and initialize loop requirements
+        #we also use the depth map of each pixel to determine mapping procedure of each thread
+        elevation = np.unique(cur_map[:,:,2].astype(np.int32))  #pixel depth information
+        gate_way = []   #container for mapped/unmapped pixels, so we only have one label per pixel
+        for e in elevation:
+            #GET THE THREADS THAT STAYED WITHIN BOUNDS IN THE UPDATED MAP.
+            #FIX INTERSECTIONS BY LOOKING AT DEPTH
+            leftbound = np.logical_and(np.logical_and(cur_map[:,:,0] >= 0,cur_map[:,:,1] >= 0),cur_map[:,:,2].astype(np.uint32) == e)
+            rightbound = np.logical_and(np.logical_and(cur_map[:,:,1] < h-1,cur_map[:,:,0] < w-1),cur_map[:,:,2].astype(np.uint32) == e)
+            boundry = np.logical_and(leftbound,rightbound)  #threads which are still within bounds
+
+            #GATHER INDICES USING MAPPED PIXEL POSITIONS + FLOW
+            idx = cur_map[boundry][:,1].astype(np.uint32) * w + cur_map[boundry][:,0].astype(np.uint32) #img positions
+            idx_label = grid[boundry][:,1].astype(np.uint32) * w + grid[boundry][:,0].astype(np.uint32)     #label positions
+
+            #TAKE THE LOGICAL INVERSE OF IS IN
+            idx_mask = np.logical_not(np.isin(idx, gate_way))       #IF THE IDX HAS BEEN DISCOVERED BEFORE, IT WILL APPEAR IN GATEWAY
+
+            #UPDATE ONE THREAD PER INTERSECTION
+            out[:,:,i,:2].reshape((h*w,2))[idx_label[idx_mask]] = flow.reshape((h*w,2))[idx[idx_mask]]
+            out[:,:,i,2:4].reshape((h*w,2))[idx_label[idx_mask]] = cur_map.reshape((h*w,3))[idx_label[idx_mask]][:,:2]
+            out[:,:,i,4].reshape((h*w))[idx_label[idx_mask]] = depth.reshape((h*w))[idx[idx_mask]]
+
+            #UPDATE THE MEMORY GATE
+            gate_way += list(idx)
+
+        #CHECK HOLES AND NON HOLES
+        #FIX THE HOLES THAT WERE CREATED WHEN PUSHING THE MAP WITH OPTICAL FLOW
+        holes = np.all(out[:,:,i,:] == [0,0,0,0,0],axis=-1)
+        non_holes = np.logical_not(holes)
+        holes_flat = holes.reshape((h*w))
+
+        idx = indices - set(gate_way)
+        min_val = int(min(len(idx),np.count_nonzero(holes)))      #TAKE THE MIN LENGTH BETWEEN THE NUMBER OF HOLES AND THE NUMBER OF AVAILABLE LABELS
+        out[holes] = 0                                #RESET NON-ACTIVE THREADS
+        out[:,:,i,:2].reshape((h*w,2))[positions[holes_flat][:min_val]] = flow.reshape((h*w,2))[list(idx)][:min_val]
+        out[:,:,i,2:4].reshape((h*w,2))[positions[holes_flat][:min_val]] = grid.reshape((h*w,2))[list(idx)][:min_val]
+        out[:,:,i,4].reshape((h*w))[positions[holes_flat][:min_val]] = depth.reshape((h*w))[list(idx)][:min_val]
+
+        #UPDATE THE ACTIVE THREADS ACCORDING TO UPDATED THREADS
+        holes = np.all(out[:,:,i,:] == [0,0,0,0,0],axis=-1)
+        non_holes = np.logical_not(holes)
+        active_threads = np.logical_and(non_holes,active_threads)
+
+        #UPDATE THE MAP FOR THE NEXT ITERATION. MAKE SURE TO UPDATE THE ACTIVE THREADS ONLY
+        idx = np.rint(cur_map.reshape((h*w,3))[:,1] * w + cur_map.reshape((h*w,3))[:,0]).astype(np.int32)
+        pos_mask = idx >= 0           #mask for pos values
+        bound_mask = idx < h*w    #mask for inbounds values
+        bound = np.logical_and(pos_mask,bound_mask) #combined mask
+        idx_label = np.rint(grid.reshape((h*w,2))[:,1] * w + grid.reshape((h*w,2))[:,0]).astype(np.int32)   #get labels of current active threads
+
+        #SET THE CURRENT MAP TO NEXT MAP BY ITS CORRESPONDING OPTICAL FLOW
+        spot = np.where(idx_label == 100 * w + 400)
+
+        #print(out[100,400],flow.reshape((h*w,2))[idx[spot[0]]])
+        cur_map.reshape((h*w,3))[:,:2][idx_label[bound]] = cur_map.reshape((h*w,3))[:,:2][idx_label[bound]] + out[:,:,i,:2].reshape((h*w,2))[idx_label[bound]] #push current map to the next map for next iteration
+
+        #MAKE SURE TO SET THE DEPTH OF THE NEXT MAP TO THE NEXT ITERATION OF THE LOOP. OTHERWISE SET IT TO ITS PREVIOUS VALUE
+        if i < n-1: cur_map.reshape((h*w,3))[:,2][idx_label[bound]] = d_maps[i+1].reshape((h*w))[idx[bound]]
+        else: cur_map.reshape((h*w,3))[:,2][idx_label[bound]] = out[:,:,i-1,4].reshape((h*w))[idx[bound]]
+
+        '''
+        #VISUALIZATION
+        for j in range(10):
+            for z in range(10):
+                x = int(w/10) * j + 40
+                y = int(h/10) * z + 20
+                c = tuple(out[y,x,i,2:4].astype(np.uint32))
+                a = 255 / 10 * j
+                b = 255 / 10 * z
+                cv2.circle(img,c,5,[a,0,b],thickness=-1)
+        c = tuple(out[100,400,i,2:4].astype(np.int32))
+        cv2.circle(img,c,10,[255,0,0],thickness=-1)
+        cv2.imshow('labeled points',img)
+        cv2.waitKey(0)
+        '''
+
+    return out
 
 ####################################################################################################################################
-#NOTE THAT THE FLOW
-#assuming flows is already ordered such that flows[0] = t and flows[n] = t - s
-#NOTE THAT THIS FUNCTION CREATES SEQUENCES FOR THE FLOW AND ORDERING OF THE DATA MATTERS!
-#IF T0 IS REFERENCING T THEN THEN WE ARE SEQUENCING FLOW VECTOR BACKWARDS FROM T TO T-N.
-#IF T0 IS REFERENCING T-N THEN WE ARE SEQUENCING FLOW VECTOR FORWARD FROM T-N TO T
-def stitchFlow(flows,mode='back'):
-    n,h,w,d = flows.shape
+"""
+I/O script to save and load the data coming with the MPI-Sintel low-level
+computer vision benchmark.
 
-    #SORRY I WAS TOO LAZY TO FIX THE DATA READING
-    data = np.zeros((n,h,w,d))
-    out1 = np.zeros((h,w,n,d))
-    out2 = np.zeros((h,w,n,d))
+For more details about the benchmark, please visit www.mpi-sintel.de
 
-    #loop through each flow and map the current pixels backwards in time
-    for i,flow in enumerate(flows):
-        t = (n-1) - i
-        if i == 0:
-            prv_map = np.dstack(np.meshgrid(np.arange(w),np.arange(h)))
-            data[t] = flows[0]
-            out2[:,:,i,:] = prv_map
-            continue
+CHANGELOG:
+v1.0 (2015/02/03): First release
 
-        #MOVE THE PRVEVIOUS MAP TO THE CURRENT MAP
-        #PLUS SIGN MOVE CUR_IMAGE BACKWARDS WITH CUR_FLOW
-        if mode == 'back':
-            cur_map = np.rint(prv_map + data[t+1]).astype(np.int64)
-        else:
-            cur_map = np.rint(prv_map - data[t+1]).astype(np.int64)
+Copyright (c) 2015 Jonas Wulff
+Max Planck Institute for Intelligent Systems, Tuebingen, Germany
 
-        #FIND THE NEW BOUNDRIES I.E SPOTS WHERE THE CURMAP FALL OFF THE IMAGE
-        leftbound = np.logical_and(cur_map[:,:,0] >= 0,cur_map[:,:,1] >= 0)
-        rightbound = np.logical_and(cur_map[:,:,1] < h,cur_map[:,:,0] < w )
-        boundry = np.logical_and(leftbound,rightbound)
+"""
+#READ DEPTH
 
-        #set data out of bounds to the previous
-        data[t][np.logical_not(boundry)] = data[t+1][np.logical_not(boundry)]
+def read_depth(filename):
+    """ Read depth data from file, return as numpy array. """
+    f = open(filename,'rb')
+    TAG_FLOAT = 202021.25
+    TAG_CHAR = 'PIEH'
+    check = np.fromfile(f,dtype=np.float32,count=1)[0]
+    assert check == TAG_FLOAT, ' depth_read:: Wrong tag in flow file (should be: {0}, is: {1}). Big-endian machine? '.format(TAG_FLOAT,check)
+    width = np.fromfile(f,dtype=np.int32,count=1)[0]
+    height = np.fromfile(f,dtype=np.int32,count=1)[0]
+    size = width*height
+    assert width > 0 and height > 0 and size > 1 and size < 100000000, ' depth_read:: Wrong input size (width = {0}, height = {1}).'.format(width,height)
+    depth = np.fromfile(f,dtype=np.float32,count=-1).reshape((height,width))
 
-        #WELL THIS IS PROBABLY MY MOST WELL MADE ALGORITHM...
-        #THIS ONE SAYS TAKE YOUR BIPARTITE GRAPH DATA_t, FLOW AND CONNECT THEM USING CUR_MAP WHICH SETS DATA_ij to FLOW_ab by the
-        #linear function C = A * w + B   where A is the list of column_id in CUR_MAP, B is the list of row_id in CUR_MAP, and C would be the
-        #index of Flow_ij flattened. We then set DATA_ij to FLOW_ab if it is within the boundries of ij
-        idx = (cur_map[boundry][:,1] * (w)) + cur_map[boundry][:,0]
-
-        data[t][boundry][:,0] = flow[:,:,0].flatten()[idx]
-        data[t][boundry][:,1] = flow[:,:,1].flatten()[idx]
-        data[t][boundry] = np.dstack((flow[:,:,0].flatten()[idx],flow[:,:,1].flatten()[idx]))
-        out2[:,:,i,:] = cur_map.copy()
-
-        prv_map = cur_map.copy()
-
-    for i in range(n):
-        out1[:,:,i,:] = data[i,:,:,:]
-
-    out2[:,:,:,0] = out2[:,:,:,0] / w
-    out2[:,:,:,1] = out2[:,:,:,1] / h
-
-    return out1,out2
+    return depth
 
 ####################################################################################################################################
 #LEARN BACKGROUND?
@@ -359,66 +440,35 @@ if __name__ == '__main__':
         cv2.imwrite(os.path.join(OUT_DIR,fout),warped_img)
         cv2.waitKey(0)
 
-    elif 'stitchflow' in sys.argv:
-
+    elif 'stitch' in sys.argv:   #DEBUGGING OF FUNCTIONS. FEEL FREE TO EDIT AS YOU WISH
+        start_time = time.time()
+        depth_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/MPI-Sintel-depth-training-20150305/training/depth/market_2/'
+        flow_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/flow/market_2/'
+        img_dir = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/clean/market_2/'
+        first_img = '/media/cvlab/a1716558-819e-4d9f-9a0c-e0fac162c845/cvlab3114/MPI-Sintel-complete/training/clean/market_2/frame_0005.png'
         HEIGHT = 436
         WIDTH = 1024
-        DEPTH = 2
 
-        filedir = sys.argv[2]
-        topimg = 'data/flow/market2_frame_0049.png'
-        #topimg = 'data/flow/cave4_frame_0049.png'
+        #CHECK IF DIRECTORY EXISTS
+        if os.path.isdir(depth_dir) and os.path.isdir(flow_dir):
+            depth_list = os.listdir(depth_dir)
+            flow_list = os.listdir(flow_dir)
+            img_list = os.listdir(img_dir)
+            depth_list.sort() ; flow_list.sort() ; img_list.sort()
+            depth_list = [os.path.join(depth_dir,fname) for fname in depth_list][4:15]
+            flow_list = [os.path.join(flow_dir,fname) for fname in flow_list][4:15]
+            img_list = [os.path.join(img_dir,fname) for fname in img_list][4:15]
 
-        if os.path.isdir(filedir):
-            dirlist = os.listdir(filedir)
-            dirlist.sort()
-            dirlist.reverse()
-            length = len(dirlist)
-            flows = np.zeros((length,HEIGHT,WIDTH,DEPTH),dtype=np.float32)
-            for i,f in enumerate(dirlist):
-                flow = readflofile(os.path.join(filedir,f))
-                h,w,d = flow.shape
+            #READ FIRST 5 FRAMES
+            depth_map = np.stack([read_depth(depth_list[i]) for i in range(5)])
+            flow_map = np.stack([readflofile(flow_list[i]) for i in range(5)])
+            img_map = np.stack([cv2.imread(img_list[i]) for i in range(5)])
 
-                #no guarantees right?
-                assert h == HEIGHT
-                assert w == WIDTH
-                assert d == DEPTH
+            data = stitchFlow(flow_map,depth_map,img_map)
 
-                flows[i] = flow
-
-            featuremap = stitchFlow(flows)
-            imgtop = cv2.imread(topimg)
-            video = genFlowSeq(imgtop,featuremap)
-
-    elif 'stitchflow2' in sys.argv:
-
-        HEIGHT = 436
-        WIDTH = 1024
-        DEPTH = 2
-
-        filedir = sys.argv[2]
-        topimg = 'data/flow/market2_frame_0001.png'
-        #topimg = 'data/flow/cave4_frame_0049.png'
-
-        if os.path.isdir(filedir):
-            dirlist = os.listdir(filedir)
-            dirlist.sort()
-            length = len(dirlist)
-            flows = np.zeros((length,HEIGHT,WIDTH,DEPTH),dtype=np.float32)
-            for i,f in enumerate(dirlist):
-                flow = readflofile(os.path.join(filedir,f))
-                h,w,d = flow.shape
-
-                #no guarantees right?
-                assert h == HEIGHT
-                assert w == WIDTH
-                assert d == DEPTH
-
-                flows[i] = flow
-
-            featuremap = stitchFlow(flows)
-            imgtop = cv2.imread(topimg)
-            video = genFlowSeq(imgtop,featuremap)
+        holes = np.all(data[:,:,0,:] == [0,0,0,0,0],axis=-1)
+        print(data[holes])
+        print("execution time: %s seconds" % (time.time() - start_time))
 
     else:
         print("""HERE IS SOME HELP FOR USING THESE TOOLS
@@ -432,8 +482,10 @@ if __name__ == '__main__':
         5. [warp]
         6. [backwarp]
         7. [customwarp] [img_path] [flo_path]
-        7. [stitchflow] [flow_dir]
+        7. [stitch]
 
         """)
+
+
 
 
